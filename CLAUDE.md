@@ -4,16 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Development Commands
 
+### Frontend (React UI)
 - `npm run dev` — Start Vite dev server (port 5173)
 - `npm run build` — TypeScript type-check + Vite production build
 - `npm run lint` — Run ESLint
 - `npm run preview` — Preview production build
 
+### Python (RL Training)
+- `source venv/bin/activate` — Activate the Python virtual environment
+- `uv pip install -r requirements.txt` — Install/update Python dependencies
+- `uv pip install <package>` — Add a new package (then update requirements.txt)
+
+All Python commands must be run with the `venv/` virtual environment activated or with `VIRTUAL_ENV=venv uv pip ...`. Use `uv` for all package management — do not use raw `pip`.
+
 No test framework is currently configured.
 
 ## Tech Stack
 
-React 18 + TypeScript (strict mode) + Vite + Tailwind CSS 3. Icons from lucide-react. ESLint with TypeScript ESLint and React Hooks plugins.
+**Frontend:** React 18 + TypeScript (strict mode) + Vite + Tailwind CSS 3. Icons from lucide-react. ESLint with TypeScript ESLint and React Hooks plugins.
+
+**Python/RL:** Python 3.12 + PyTorch + Gymnasium + TensorBoard + NumPy + Matplotlib. Managed via `uv` with a local `venv/` virtual environment.
 
 ## Architecture
 
@@ -31,3 +41,7 @@ This is a Stratego board game where a human (red) plays against an AI opponent (
 - `src/App.tsx` — Orchestrates game state, handles cell clicks, executes moves, and triggers AI turns.
 
 **AI:** Currently random move selection (`makeComputerMove`). The project name suggests reinforcement learning is the intended enhancement.
+
+## Python Environment
+
+The `venv/` directory contains the Python virtual environment created with `uv`. Key dependencies are listed in `requirements.txt`. Always use `uv` (not `pip`) for installing packages.

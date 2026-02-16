@@ -1,536 +1,735 @@
 """
-A complete Python implementation for a simplified Stratego game environment,
-its simulation, and RL training using PPO from Stable Baselines 3.
+Stratego RL training with action-masked PPO, CNN observations, reward shaping,
+and self-play.
 
-This code includes:
-1. A custom Gym environment for Stratego.
-2. Methods to set up the board, generate legal moves, and resolve battles.
-3. An RL training loop that trains an agent (Player 1) against a random opponent.
+Implements:
+- 25-channel (12 per player + 1 lake) CNN observation space on a 10x10 board
+- Pre-computed geometric move table with flat Discrete action space + masking
+- BattleResult-based reward shaping (rank * CAPTURE_REWARD_SCALE)
+- Self-play via SelfPlayCallback (snapshots + opponent swaps)
+- StrategoCNN feature extractor (3 conv layers → 256-dim)
+- MaskablePPO from sb3-contrib
 """
 
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-import random
+import copy
 import os
+import random
+from collections import namedtuple
+from typing import Optional
+
+import gymnasium as gym
+import numpy as np
+import torch as th
+from gymnasium import spaces
+from torch import nn
+
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 # =============================================================================
-# Constants and Helper Functions
+# Constants
 # =============================================================================
 
-# Board settings
 BOARD_SIZE = 10
 EMPTY = 0
-LAKE = 100  # A special value representing a lake cell
+LAKE = 100
 
-# Define the fixed lake positions (0-indexed). In standard Stratego there are two lakes.
-LAKE_POSITIONS = [(4, 2), (4, 3), (5, 2), (5, 3),
-                  (4, 6), (4, 7), (5, 6), (5, 7)]
+LAKE_POSITIONS = [
+    (4, 2), (4, 3), (5, 2), (5, 3),
+    (4, 6), (4, 7), (5, 6), (5, 7),
+]
+LAKE_POSITIONS_SET = frozenset(LAKE_POSITIONS)
 
-# Special values used to encode the two non-numeric pieces:
-FLAG_VALUE = 1000  # We use this to encode the Flag.
-BOMB_VALUE = 1001  # We use this to encode Bombs.
+FLAG_VALUE = 1000
+BOMB_VALUE = 1001
 
-# The standard counts for each piece type in a full Stratego set:
 PIECE_COUNTS = {
-    'Flag': 1,
-    'Bomb': 6,
-    'Marshal': 1,
-    'General': 1,
-    'Colonel': 2,
-    'Major': 3,
-    'Captain': 4,
-    'Lieutenant': 4,
-    'Sergeant': 4,
-    'Miner': 5,
-    'Scout': 8,
-    'Spy': 1
+    "Flag": 1,
+    "Bomb": 6,
+    "Marshal": 1,
+    "General": 1,
+    "Colonel": 2,
+    "Major": 3,
+    "Captain": 4,
+    "Lieutenant": 4,
+    "Sergeant": 4,
+    "Miner": 5,
+    "Scout": 8,
+    "Spy": 1,
 }
 
-# The “rank” values for all movable (non-special) pieces.
-# (Higher numbers defeat lower numbers except for special cases.)
 PIECE_RANKS = {
-    'Spy': 1,
-    'Scout': 2,
-    'Miner': 3,
-    'Sergeant': 4,
-    'Lieutenant': 5,
-    'Captain': 6,
-    'Major': 7,
-    'Colonel': 8,
-    'General': 9,
-    'Marshal': 10
+    "Spy": 1,
+    "Scout": 2,
+    "Miner": 3,
+    "Sergeant": 4,
+    "Lieutenant": 5,
+    "Captain": 6,
+    "Major": 7,
+    "Colonel": 8,
+    "General": 9,
+    "Marshal": 10,
 }
+
+# 12 piece types for channel encoding (order matters for indexing)
+PIECE_TYPES = [
+    "Flag", "Spy", "Scout", "Miner", "Sergeant", "Lieutenant",
+    "Captain", "Major", "Colonel", "General", "Marshal", "Bomb",
+]
+PIECE_TYPE_TO_CHANNEL = {t: i for i, t in enumerate(PIECE_TYPES)}
+
+# Observation: 12 channels for agent pieces, 12 for opponent, 1 for lakes
+NUM_CHANNELS = 25
+
+CAPTURE_REWARD_SCALE = 0.01
+
+BattleResult = namedtuple(
+    "BattleResult",
+    ["attacker_type", "defender_type", "attacker_rank", "defender_rank", "outcome"],
+)
+# outcome: "attacker_wins", "defender_wins", "both_die"
+
+DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+# =============================================================================
+# Pre-compute ALL_MOVES: every geometrically valid (from, to) on a 10x10 board
+# =============================================================================
+
+
+def _precompute_moves():
+    """Build a list of all geometrically possible moves (no piece/state checks).
+
+    Includes:
+    - Single-step orthogonal moves for all cells (non-lake → non-lake)
+    - Multi-step scout moves along straight lines (non-lake → non-lake,
+      no lake in between -- but we only check geometry here; legality is
+      checked at runtime via action_masks).
+    """
+    moves = []
+    move_index = {}
+
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if (r, c) in LAKE_POSITIONS_SET:
+                continue
+            for dr, dc in DIRECTIONS:
+                # Walk along the direction (distance 1..8 covers the board)
+                for dist in range(1, BOARD_SIZE):
+                    nr, nc = r + dr * dist, c + dc * dist
+                    if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                        break
+                    if (nr, nc) in LAKE_POSITIONS_SET:
+                        break  # can't pass through or land on lake
+                    move = (r, c, nr, nc)
+                    if move not in move_index:
+                        move_index[move] = len(moves)
+                        moves.append(move)
+
+    return moves, move_index
+
+
+ALL_MOVES, MOVE_TO_INDEX = _precompute_moves()
+ACTION_SPACE_SIZE = len(ALL_MOVES)
+
+
+# =============================================================================
+# Helper: piece value ↔ info
+# =============================================================================
+
 
 def get_piece_info(piece_value):
-    """
-    Given an encoded piece value, return a dictionary with details:
-      - owner: 1 (agent / Player 1) or -1 (opponent / Player 2)
-      - type: a string (e.g. "Scout", "Bomb", "Flag", etc.)
-      - rank: an integer rank (if applicable; Bombs have no rank)
-    
-    Returns None for EMPTY or LAKE cells.
-    """
     if piece_value == EMPTY or piece_value == LAKE:
         return None
     owner = 1 if piece_value > 0 else -1
     abs_val = abs(piece_value)
     if abs_val == FLAG_VALUE:
-        return {'owner': owner, 'type': 'Flag', 'rank': 0}
+        return {"owner": owner, "type": "Flag", "rank": 0}
     elif abs_val == BOMB_VALUE:
-        return {'owner': owner, 'type': 'Bomb', 'rank': None}
+        return {"owner": owner, "type": "Bomb", "rank": 0}
     else:
-        # For normal pieces, use the rank (which was encoded as a positive integer)
         for piece_type, rank in PIECE_RANKS.items():
             if rank == abs_val:
-                return {'owner': owner, 'type': piece_type, 'rank': rank}
-        return {'owner': owner, 'type': 'Unknown', 'rank': abs_val}
+                return {"owner": owner, "type": piece_type, "rank": rank}
+        return {"owner": owner, "type": "Unknown", "rank": abs_val}
+
 
 # =============================================================================
-# The Stratego Gym Environment
+# Environment
 # =============================================================================
+
 
 class StrategoEnv(gym.Env):
+    """Stratego environment with CNN observations and action masking.
+
+    The agent is Player 1 (positive piece values, rows 6-9).
+    The opponent is Player -1 (negative piece values, rows 0-3).
+    After the agent acts, the opponent auto-moves (random or learned policy).
     """
-    A custom OpenAI Gym environment for a simplified version of Stratego.
-    
-    Game assumptions:
-      - Full observability: all pieces are visible.
-      - The board is 10x10 with fixed lake positions.
-      - Player 1 (RL agent) deploys pieces in rows 6-9.
-      - Player 2 (opponent) deploys pieces in rows 0-3.
-      - Movement is orthogonal (up, down, left, right).
-      - Most pieces move one cell; Scouts can move multiple cells.
-      - Battles are resolved by comparing ranks (with special rules for bombs, flags,
-        and the spy attacking the marshal).
-      
-    The agent (Player 1) takes an action when it is its turn. When it completes a move,
-    the environment automatically simulates the opponent (Player 2) by making a random legal move.
-    """
-    
-    metadata = {'render.modes': ['human']}
-    
-    def __init__(self):
-        super(StrategoEnv, self).__init__()
-        
-        # The observation is the board state: a 10x10 grid of integers.
-        # Each integer encodes a piece (its type and owner) or EMPTY/LAKE.
-        self.observation_shape = (BOARD_SIZE, BOARD_SIZE)
-        self.observation_space = spaces.Box(low=-BOMB_VALUE, high=BOMB_VALUE,
-                                            shape=self.observation_shape, dtype=np.int32)
-        
-        # The action is represented by four coordinates: (from_x, from_y, to_x, to_y).
-        # We use a MultiDiscrete space with each coordinate in [0, BOARD_SIZE - 1].
-        self.action_space = spaces.MultiDiscrete([BOARD_SIZE, BOARD_SIZE, BOARD_SIZE, BOARD_SIZE])
-        
-        # Initialize the game state.
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, opponent_policy=None, render_mode=None):
+        super().__init__()
+
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
+
+        self.opponent_policy = opponent_policy
+        self.render_mode = render_mode
+
         self.board = None
-        self.current_player = 1  # 1 for the agent (Player 1); -1 for opponent.
+        self.current_player = 1
         self.done = False
-        
-        # For logging purposes.
-        self.last_action = None
-        #self.seed = 69
-        self.reset()
-    
-    # def seed(self, val=69):
-    #     return val
-        
-    def reset(self, seed=None, options=None):
+
+    # ------------------------------------------------------------------
+    # Opponent policy setter (for self-play)
+    # ------------------------------------------------------------------
+
+    def set_opponent_policy(self, policy):
+        self.opponent_policy = policy
+
+    # ------------------------------------------------------------------
+    # Observation helpers
+    # ------------------------------------------------------------------
+
+    def _get_obs(self):
+        """Build a 25-channel binary tensor from self.board.
+
+        Channels 0-11:  agent (player 1) piece types
+        Channels 12-23: opponent (player -1) piece types
+        Channel 24:     lake mask
         """
-        Reset the game state: create an empty board, place lakes, and deploy both players’ pieces.
-        Returns the initial board observation and an empty info dictionary.
-        """
-        # Create an empty board.
-        self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
-        
-        # Set fixed lake positions.
-        for pos in LAKE_POSITIONS:
-            self.board[pos] = LAKE
-        
-        # Randomly place pieces for each player.
-        self._place_pieces_for_player(1)   # Player 1 (agent) in rows 6-9.
-        self._place_pieces_for_player(-1)  # Player 2 (opponent) in rows 0-3.
-        
-        self.current_player = 1  # Agent starts.
-        self.done = False
-        self.last_action = None
-        
-        return self.board.copy(), {}
-    
+        obs = np.zeros((NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                val = self.board[r, c]
+                if val == LAKE:
+                    obs[24, r, c] = 1.0
+                elif val != EMPTY:
+                    info = get_piece_info(val)
+                    if info is None:
+                        continue
+                    ch = PIECE_TYPE_TO_CHANNEL.get(info["type"])
+                    if ch is None:
+                        continue
+                    if info["owner"] == 1:
+                        obs[ch, r, c] = 1.0
+                    else:
+                        obs[12 + ch, r, c] = 1.0
+        return obs
+
+    def _get_obs_for_opponent(self):
+        """Observation from the opponent's perspective (swap agent/opponent channels)."""
+        obs = self._get_obs()
+        agent_channels = obs[:12].copy()
+        obs[:12] = obs[12:24]
+        obs[12:24] = agent_channels
+        return obs
+
+    # ------------------------------------------------------------------
+    # Action masks
+    # ------------------------------------------------------------------
+
+    def action_masks(self):
+        """Boolean mask over ALL_MOVES: True where the move is legal for the agent."""
+        return self._get_action_masks_for_player(1)
+
+    def _get_action_masks_for_player(self, player):
+        mask = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        legal = self._get_legal_moves(player)
+        for move in legal:
+            idx = MOVE_TO_INDEX.get(move)
+            if idx is not None:
+                mask[idx] = True
+        return mask
+
+    # ------------------------------------------------------------------
+    # Legal move generation
+    # ------------------------------------------------------------------
+
+    def _get_legal_moves(self, player):
+        """Return list of (from_r, from_c, to_r, to_c) tuples for `player`."""
+        moves = []
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                piece = self.board[r, c]
+                if piece == EMPTY or piece == LAKE:
+                    continue
+                if (piece > 0 and player != 1) or (piece < 0 and player != -1):
+                    continue
+                info = get_piece_info(piece)
+                if info["type"] in ("Flag", "Bomb"):
+                    continue
+
+                is_scout = info["type"] == "Scout"
+                for dr, dc in DIRECTIONS:
+                    max_dist = BOARD_SIZE if is_scout else 1
+                    for dist in range(1, max_dist + 1):
+                        nr, nc = r + dr * dist, c + dc * dist
+                        if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                            break
+                        target = self.board[nr, nc]
+                        if target == LAKE:
+                            break
+                        if target == EMPTY:
+                            moves.append((r, c, nr, nc))
+                        else:
+                            target_info = get_piece_info(target)
+                            if target_info and target_info["owner"] != player:
+                                moves.append((r, c, nr, nc))
+                            break  # blocked by any piece (friendly or enemy)
+        return moves
+
+    # Keep public alias for compatibility
+    def get_legal_moves(self, player):
+        return self._get_legal_moves(player)
+
+    # ------------------------------------------------------------------
+    # Piece placement
+    # ------------------------------------------------------------------
+
     def _place_pieces_for_player(self, player):
-        """
-        Deploy pieces for the given player.
-        For player 1, use rows 6-9; for player -1, use rows 0-3.
-        Pieces are randomly shuffled into the deployment area.
-        """
         pieces = []
         for piece_type, count in PIECE_COUNTS.items():
             for _ in range(count):
-                if piece_type == 'Flag':
-                    piece_value = FLAG_VALUE if player == 1 else -FLAG_VALUE
-                elif piece_type == 'Bomb':
-                    piece_value = BOMB_VALUE if player == 1 else -BOMB_VALUE
+                if piece_type == "Flag":
+                    pieces.append(FLAG_VALUE if player == 1 else -FLAG_VALUE)
+                elif piece_type == "Bomb":
+                    pieces.append(BOMB_VALUE if player == 1 else -BOMB_VALUE)
                 else:
-                    # For normal pieces, encode as the piece’s rank.
-                    piece_value = PIECE_RANKS[piece_type] if player == 1 else -PIECE_RANKS[piece_type]
-                pieces.append(piece_value)
-        
+                    rank = PIECE_RANKS[piece_type]
+                    pieces.append(rank if player == 1 else -rank)
+
         random.shuffle(pieces)
-        
-        # Determine which rows are available for deployment.
-        if player == 1:
-            rows = list(range(6, 10))
-        else:
-            rows = list(range(0, 4))
-        
-        available_positions = [(r, c) for r in rows for c in range(BOARD_SIZE) if self.board[r, c] == EMPTY]
-        
-        # Place each piece in a random available position.
-        for piece in pieces:
-            if not available_positions:
-                break  # This should not happen if counts match available cells.
-            pos = random.choice(available_positions)
+
+        rows = list(range(6, 10)) if player == 1 else list(range(0, 4))
+        positions = [
+            (r, c)
+            for r in rows
+            for c in range(BOARD_SIZE)
+            if self.board[r, c] == EMPTY
+        ]
+
+        for piece, pos in zip(pieces, positions):
             self.board[pos] = piece
-            available_positions.remove(pos)
-    
-    def step(self, action):
-        """
-        Execute one game step.
-        
-        Parameters:
-          action: a tuple (from_x, from_y, to_x, to_y) representing the agent’s move.
-          
-        Returns:
-          observation: the updated board state (a copy of the board array).
-          reward: the reward for this move (win: +1, loss: -1, illegal move: -0.1, else 0).
-          done: whether the game is over.
-          info: auxiliary debugging information.
-        """
-        if self.done:
-            return self.board.copy(), 0, self.done, False, {}
-        
-        reward = 0
-        info = {}
-        self.last_action = action
-        
-        # The agent (Player 1) should only act on its turn.
-        if self.current_player != 1:
-            # (This should not happen because we simulate opponent moves automatically.)
-            return self.board.copy(), reward, self.done, False, info
-        
-        # Parse the action tuple.
-        from_x, from_y, to_x, to_y = action
-        
-        # Retrieve the legal moves for the agent.
-        legal_moves = self.get_legal_moves(self.current_player)
-        if (from_x, from_y, to_x, to_y) not in legal_moves:
-            # Illegal move: assign a small penalty and do not change the state.
-            reward = -0.1
-            return self.board.copy(), reward, self.done, False, {"illegal_move": True}
-        
-        # Execute the agent’s move.
-        self._execute_move(from_x, from_y, to_x, to_y)
-        
-        # Check for win/loss conditions immediately after the agent’s move.
-        if self.done:
-            # (Typically, the agent’s win occurs here; losses are more likely after opponent moves.)
-            return self.board.copy(), reward, self.done, info
-        
-        # Now simulate the opponent’s move(s) until it is again the agent’s turn or the game ends.
-        while not self.done and self.current_player == -1:
-            opponent_moves = self.get_legal_moves(self.current_player)
-            if not opponent_moves:
-                # Opponent has no legal moves; the agent wins.
-                self.done = True
-                reward = 1
-                break
-            # Choose a random legal move for the opponent.
-            opp_move = random.choice(opponent_moves)
-            self._execute_move(*opp_move)
-        
-        # If the game ended during the opponent’s move, assign a loss reward for the agent.
-        if self.done:
-            reward = -1
-        
-        return self.board.copy(), reward, self.done, info
-    
-    def _execute_move(self, from_x, from_y, to_x, to_y):
-        """
-        Execute a move from (from_x, from_y) to (to_x, to_y) for the current player.
-        This method moves the piece, handles battles, and then switches the turn.
-        """
-        moving_piece = self.board[from_x, from_y]
-        target_piece = self.board[to_x, to_y]
-        
-        # If the destination is empty, simply move the piece.
-        if target_piece == EMPTY:
-            self.board[to_x, to_y] = moving_piece
-            self.board[from_x, from_y] = EMPTY
-        else:
-            # A battle occurs because the destination is occupied by an enemy piece.
-            self._resolve_battle(from_x, from_y, to_x, to_y)
-        
-        # Check if the game has been won/lost.
-        self._check_win_conditions()
-        
-        # Switch the turn (if the game is not yet over).
-        if not self.done:
-            self.current_player *= -1
-    
-    def _resolve_battle(self, from_x, from_y, to_x, to_y):
-        """
-        Resolve a battle when a piece moves into an enemy-occupied square.
-        
-        Battle rules implemented:
-          - If the defender is a Flag, the attacker wins immediately.
-          - If the defender is a Bomb, only a Miner can win.
-          - A Spy attacking a Marshal wins (special rule).
-          - Otherwise, compare piece ranks.
-          - If the ranks are equal, both pieces are removed.
-        """
-        attacker_val = self.board[from_x, from_y]
-        defender_val = self.board[to_x, to_y]
-        
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
+        for pos in LAKE_POSITIONS:
+            self.board[pos] = LAKE
+        self._place_pieces_for_player(1)
+        self._place_pieces_for_player(-1)
+        self.current_player = 1
+        self.done = False
+        return self._get_obs(), {}
+
+    # ------------------------------------------------------------------
+    # Battle resolution → BattleResult
+    # ------------------------------------------------------------------
+
+    def _resolve_battle(self, from_r, from_c, to_r, to_c):
+        """Resolve combat and update the board. Returns a BattleResult."""
+        attacker_val = self.board[from_r, from_c]
+        defender_val = self.board[to_r, to_c]
         attacker = get_piece_info(attacker_val)
         defender = get_piece_info(defender_val)
-        
-        # If the defender is the Flag, capture it and win the game.
-        if defender['type'] == 'Flag':
-            self.board[to_x, to_y] = attacker_val
-            self.board[from_x, from_y] = EMPTY
+
+        a_type, d_type = attacker["type"], defender["type"]
+        a_rank, d_rank = attacker["rank"], defender["rank"]
+
+        # Flag captured → attacker wins, game over
+        if d_type == "Flag":
+            self.board[to_r, to_c] = attacker_val
+            self.board[from_r, from_c] = EMPTY
             self.done = True
-            return
-        
-        # If the defender is a Bomb, only a Miner can defuse it.
-        if defender['type'] == 'Bomb':
-            if attacker['type'] == 'Miner':
-                self.board[to_x, to_y] = attacker_val
-                self.board[from_x, from_y] = EMPTY
+            return BattleResult(a_type, d_type, a_rank, d_rank, "attacker_wins")
+
+        # Bomb: only Miner defuses
+        if d_type == "Bomb":
+            if a_type == "Miner":
+                self.board[to_r, to_c] = attacker_val
+                self.board[from_r, from_c] = EMPTY
+                return BattleResult(a_type, d_type, a_rank, d_rank, "attacker_wins")
             else:
-                # Attacker loses.
-                self.board[from_x, from_y] = EMPTY
-            return
-        
-        # Special rule: A Spy defeating a Marshal when attacking.
-        if attacker['type'] == 'Spy' and defender['type'] == 'Marshal':
-            self.board[to_x, to_y] = attacker_val
-            self.board[from_x, from_y] = EMPTY
-            return
-        
-        # Standard battle: compare ranks.
-        if attacker['rank'] is not None and defender['rank'] is not None:
-            if attacker['rank'] > defender['rank']:
-                # Attacker wins: move attacker into the defender’s square.
-                self.board[to_x, to_y] = attacker_val
-                self.board[from_x, from_y] = EMPTY
-            elif attacker['rank'] == defender['rank']:
-                # Both pieces are removed.
-                self.board[to_x, to_y] = EMPTY
-                self.board[from_x, from_y] = EMPTY
-            else:
-                # Attacker loses.
-                self.board[from_x, from_y] = EMPTY
+                self.board[from_r, from_c] = EMPTY
+                return BattleResult(a_type, d_type, a_rank, d_rank, "defender_wins")
+
+        # Spy attacks Marshal
+        if a_type == "Spy" and d_type == "Marshal":
+            self.board[to_r, to_c] = attacker_val
+            self.board[from_r, from_c] = EMPTY
+            return BattleResult(a_type, d_type, a_rank, d_rank, "attacker_wins")
+
+        # Standard rank comparison
+        if a_rank > d_rank:
+            self.board[to_r, to_c] = attacker_val
+            self.board[from_r, from_c] = EMPTY
+            return BattleResult(a_type, d_type, a_rank, d_rank, "attacker_wins")
+        elif a_rank == d_rank:
+            self.board[to_r, to_c] = EMPTY
+            self.board[from_r, from_c] = EMPTY
+            return BattleResult(a_type, d_type, a_rank, d_rank, "both_die")
         else:
-            # Fallback if ranks are somehow not comparable.
-            self.board[from_x, from_y] = EMPTY
-    
+            self.board[from_r, from_c] = EMPTY
+            return BattleResult(a_type, d_type, a_rank, d_rank, "defender_wins")
+
+    # ------------------------------------------------------------------
+    # Move execution → Optional[BattleResult]
+    # ------------------------------------------------------------------
+
+    def _execute_move(self, from_r, from_c, to_r, to_c):
+        """Execute a move. Returns BattleResult if combat occurred, else None."""
+        target = self.board[to_r, to_c]
+        if target == EMPTY:
+            self.board[to_r, to_c] = self.board[from_r, from_c]
+            self.board[from_r, from_c] = EMPTY
+            self._check_win_conditions()
+            if not self.done:
+                self.current_player *= -1
+            return None
+        else:
+            result = self._resolve_battle(from_r, from_c, to_r, to_c)
+            self._check_win_conditions()
+            if not self.done:
+                self.current_player *= -1
+            return result
+
+    # ------------------------------------------------------------------
+    # Win-condition check
+    # ------------------------------------------------------------------
+
     def _check_win_conditions(self):
-        """
-        Check whether a win/loss condition has been met:
-          - If a player’s flag is no longer on the board, that player loses.
-          - Optionally, if the current player has no legal moves, the game ends.
-        """
-        # Check that Player 1’s flag is present.
         if not np.any(self.board == FLAG_VALUE):
             self.done = True
-            return
-        # Check that Player 2’s flag is present.
-        if not np.any(self.board == -FLAG_VALUE):
+        elif not np.any(self.board == -FLAG_VALUE):
             self.done = True
-            return
-        
-        # Optionally, if the current player has no legal moves, end the game.
-        if not self.get_legal_moves(self.current_player):
+
+    def _terminal_reward_for_agent(self):
+        """Return +1 if agent won, -1 if agent lost."""
+        agent_flag = np.any(self.board == FLAG_VALUE)
+        opp_flag = np.any(self.board == -FLAG_VALUE)
+        if not opp_flag:
+            return 1.0  # opponent flag gone → agent wins
+        if not agent_flag:
+            return -1.0  # agent flag gone → agent loses
+        # Shouldn't reach here in a terminal state, but guard anyway
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Reward shaping from BattleResult
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_capture_reward(battle_result, agent_is_attacker):
+        """Small shaped reward based on piece ranks involved in combat."""
+        if battle_result is None:
+            return 0.0
+
+        outcome = battle_result.outcome
+        d_rank = battle_result.defender_rank or 0
+        a_rank = battle_result.attacker_rank or 0
+
+        if agent_is_attacker:
+            if outcome == "attacker_wins":
+                return d_rank * CAPTURE_REWARD_SCALE
+            elif outcome == "defender_wins":
+                return -a_rank * CAPTURE_REWARD_SCALE
+            else:  # both_die
+                return (d_rank - a_rank) * CAPTURE_REWARD_SCALE
+        else:
+            # Agent is defender
+            if outcome == "attacker_wins":
+                return -d_rank * CAPTURE_REWARD_SCALE
+            elif outcome == "defender_wins":
+                return a_rank * CAPTURE_REWARD_SCALE
+            else:
+                return (a_rank - d_rank) * CAPTURE_REWARD_SCALE
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+
+    def step(self, action):
+        if self.done:
+            return self._get_obs(), 0.0, True, False, {}
+
+        reward = 0.0
+        info = {}
+
+        # Decode flat action
+        from_r, from_c, to_r, to_c = ALL_MOVES[action]
+
+        # Validate
+        legal = self._get_legal_moves(1)
+        if (from_r, from_c, to_r, to_c) not in legal:
+            # With action masking this shouldn't happen, but handle gracefully
+            return self._get_obs(), -0.1, False, False, {"illegal_move": True}
+
+        # Execute agent move
+        battle = self._execute_move(from_r, from_c, to_r, to_c)
+        reward += self._compute_capture_reward(battle, agent_is_attacker=True)
+
+        if self.done:
+            reward += self._terminal_reward_for_agent()
+            return self._get_obs(), reward, True, False, info
+
+        # --- Opponent turn ---
+        opp_moves = self._get_legal_moves(-1)
+        if not opp_moves:
             self.done = True
-    
-    def get_legal_moves(self, player):
-        """
-        Generate and return a list of legal moves for the specified player.
-        
-        Each move is a tuple: (from_x, from_y, to_x, to_y)
-        
-        Movement rules:
-          - Only movable pieces (not Flag or Bomb) may move.
-          - Non-Scout pieces move one space orthogonally.
-          - Scouts can move any number of spaces in a straight line until blocked.
-          - A piece may move into an enemy-occupied square (to initiate a battle) but
-            cannot move into a square occupied by a friendly piece or a lake.
-        """
-        moves = []
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # up, down, left, right
-        
-        for x in range(BOARD_SIZE):
-            for y in range(BOARD_SIZE):
-                piece = self.board[x, y]
-                if piece == EMPTY or piece == LAKE:
-                    continue
-                # Check if this piece belongs to the current player.
-                if (piece > 0 and player == 1) or (piece < 0 and player == -1):
-                    info = get_piece_info(piece)
-                    # Skip pieces that cannot move.
-                    if info['type'] in ['Flag', 'Bomb']:
-                        continue
-                    
-                    # Try each direction.
-                    for dx, dy in directions:
-                        nx = x + dx
-                        ny = y + dy
-                        # For Scouts, allow moving several squares.
-                        if info['type'] == 'Scout':
-                            while 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
-                                if self.board[nx, ny] == LAKE:
-                                    break  # Cannot move into a lake.
-                                if self.board[nx, ny] == EMPTY:
-                                    moves.append((x, y, nx, ny))
-                                    nx += dx
-                                    ny += dy
-                                else:
-                                    # If occupied, you may be able to attack an enemy piece.
-                                    target_info = get_piece_info(self.board[nx, ny])
-                                    if target_info and target_info['owner'] != player:
-                                        moves.append((x, y, nx, ny))
-                                    break
-                        else:
-                            # Non-Scout pieces move only one square.
-                            if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
-                                if self.board[nx, ny] == LAKE:
-                                    continue
-                                if self.board[nx, ny] == EMPTY:
-                                    moves.append((x, y, nx, ny))
-                                else:
-                                    target_info = get_piece_info(self.board[nx, ny])
-                                    if target_info and target_info['owner'] != player:
-                                        moves.append((x, y, nx, ny))
-        return moves
-    
-    def render(self, mode='human'):
-        """
-        Render the board to the console in a human-readable format.
-        Displays the board grid, piece abbreviations, and indicates the current player.
-        """
+            reward += 1.0  # opponent can't move → agent wins
+            return self._get_obs(), reward, True, False, info
+
+        # Choose opponent action
+        if self.opponent_policy is not None:
+            opp_obs = self._get_obs_for_opponent()
+            opp_mask = self._get_action_masks_for_player(-1)
+            if opp_mask.any():
+                opp_action, _ = self.opponent_policy.predict(
+                    opp_obs, action_masks=opp_mask, deterministic=False
+                )
+                opp_move_tuple = ALL_MOVES[int(opp_action)]
+                # Validate the policy's move is actually legal
+                if opp_move_tuple not in opp_moves:
+                    opp_move_tuple = random.choice(opp_moves)
+            else:
+                opp_move_tuple = random.choice(opp_moves)
+        else:
+            opp_move_tuple = random.choice(opp_moves)
+
+        opp_battle = self._execute_move(*opp_move_tuple)
+        reward += self._compute_capture_reward(opp_battle, agent_is_attacker=False)
+
+        if self.done:
+            reward += self._terminal_reward_for_agent()
+            return self._get_obs(), reward, True, False, info
+
+        return self._get_obs(), reward, False, False, info
+
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
+
+    def render(self):
+        if self.render_mode != "human":
+            return
+
         def piece_str(val):
-            return self._piece_to_str(val)
-        
+            if val == EMPTY:
+                return "."
+            if val == LAKE:
+                return "~"
+            info = get_piece_info(val)
+            if info is None:
+                return "?"
+            prefix = "A" if info["owner"] == 1 else "O"
+            if info["type"] == "Flag":
+                return prefix + "F"
+            if info["type"] == "Bomb":
+                return prefix + "B"
+            return prefix + str(info["rank"])
+
         print("Current board:")
         for i in range(BOARD_SIZE):
-            row = ""
-            for j in range(BOARD_SIZE):
-                row += f"{piece_str(self.board[i, j]):>5} "
+            row = " ".join(f"{piece_str(self.board[i, j]):>4}" for j in range(BOARD_SIZE))
             print(row)
-        print(f"Current player: {'Agent (1)' if self.current_player == 1 else 'Opponent (-1)'}")
-        if self.last_action:
-            print(f"Last action: {self.last_action}")
-        print("\n")
-    
-    def _piece_to_str(self, val):
-        """
-        Convert an encoded piece value to a short string for printing.
-        Uses the following format:
-          - For Player 1, the piece string starts with 'A'
-          - For Player 2, it starts with 'O'
-          - Special pieces (Flag, Bomb) are abbreviated as F and B.
-          - Other pieces are shown by their rank.
-        """
-        if val == EMPTY:
-            return "."
-        if val == LAKE:
-            return "Lake"
-        info = get_piece_info(val)
-        if info is None:
-            return "?"
-        owner = "A" if info['owner'] == 1 else "O"
-        if info['type'] == 'Flag':
-            return owner + "F"
-        elif info['type'] == 'Bomb':
-            return owner + "B"
-        else:
-            return owner + str(info['rank'])
+        player_label = "Agent (1)" if self.current_player == 1 else "Opponent (-1)"
+        print(f"Current player: {player_label}\n")
+
 
 # =============================================================================
-# RL Training and Simulation Code Using Stable Baselines 3
+# Action masking wrapper (for sb3-contrib)
 # =============================================================================
 
-# Import PPO and the environment checker from Stable Baselines 3.
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
 
-def train_agent(total_timesteps=50000):
+def mask_fn(env: StrategoEnv) -> np.ndarray:
+    return env.action_masks()
+
+
+# =============================================================================
+# CNN Feature Extractor
+# =============================================================================
+
+
+class StrategoCNN(BaseFeaturesExtractor):
+    """3-layer CNN for the 25×10×10 observation space → 256-dim features."""
+
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        n_channels = observation_space.shape[0]  # 25
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_channels, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # Compute the flattened size
+        with th.no_grad():
+            sample = th.zeros(1, *observation_space.shape)
+            n_flat = self.cnn(sample).shape[1]
+
+        self.linear = nn.Sequential(
+            nn.Linear(n_flat, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        return self.linear(self.cnn(observations))
+
+
+# =============================================================================
+# Self-play Callback
+# =============================================================================
+
+
+class SelfPlayCallback(BaseCallback):
+    """Periodically snapshot the current model and swap the opponent policy.
+
+    Every `swap_interval` steps, with 50% probability assign a past snapshot
+    as the opponent (self-play) and 50% revert to random.
     """
-    Create an instance of the Stratego environment, check it,
-    and train an RL agent (using PPO) for the given number of timesteps.
-    
-    The trained model is saved to disk.
-    """
+
+    def __init__(
+        self,
+        save_interval: int = 50_000,
+        swap_interval: int = 25_000,
+        snapshot_dir: str = "selfplay_snapshots",
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.save_interval = save_interval
+        self.swap_interval = swap_interval
+        self.snapshot_dir = snapshot_dir
+        self.snapshots: list[str] = []
+
+    def _init_callback(self) -> None:
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        # Save snapshot
+        if self.num_timesteps % self.save_interval == 0 and self.num_timesteps > 0:
+            path = os.path.join(
+                self.snapshot_dir, f"snapshot_{self.num_timesteps}"
+            )
+            self.model.save(path)
+            self.snapshots.append(path)
+            if self.verbose:
+                print(f"[SelfPlay] Saved snapshot at {self.num_timesteps} steps")
+
+        # Swap opponent
+        if self.num_timesteps % self.swap_interval == 0 and self.num_timesteps > 0:
+            env = self.training_env.envs[0]
+            # Unwrap to get the base StrategoEnv
+            base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+
+            if self.snapshots and random.random() < 0.5:
+                snap = random.choice(self.snapshots)
+                opponent = MaskablePPO.load(snap)
+                base_env.set_opponent_policy(opponent)
+                if self.verbose:
+                    print(f"[SelfPlay] Opponent ← snapshot {snap}")
+            else:
+                base_env.set_opponent_policy(None)
+                if self.verbose:
+                    print("[SelfPlay] Opponent ← random")
+
+        return True
+
+
+# =============================================================================
+# Training
+# =============================================================================
+
+
+def train_agent(total_timesteps: int = 1_000_000, save_path: str = "stratego_ppo"):
+    """Train with MaskablePPO + CNN + self-play."""
     env = StrategoEnv()
-    
-    # (Optional) Check that the environment follows the Gym API.
-    check_env(env, warn=True)
-    
-    # Create a PPO model using a multilayer perceptron (MLP) policy.
-    model = PPO("MlpPolicy", env, verbose=1)
-    
-    # Train the model.
-    model.learn(total_timesteps=total_timesteps)
-    
-    # Save the model.
-    model.save("stratego_ppo")
-    print("Model saved as 'stratego_ppo'")
-    
+    env = ActionMasker(env, mask_fn)
+
+    policy_kwargs = dict(
+        features_extractor_class=StrategoCNN,
+        features_extractor_kwargs=dict(features_dim=256),
+        net_arch=dict(pi=[256], vf=[256]),
+    )
+
+    model = MaskablePPO(
+        "CnnPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        tensorboard_log="./stratego_tb/",
+    )
+
+    callback = SelfPlayCallback(
+        save_interval=50_000,
+        swap_interval=25_000,
+        verbose=1,
+    )
+
+    model.learn(total_timesteps=total_timesteps, callback=callback)
+    model.save(save_path)
+    print(f"Model saved as '{save_path}'")
     return model
 
-def run_simulation(model, episodes=3):
-    """
-    Run a few episodes of the game using the trained model.
-    At each step, the board is rendered and the agent’s move is determined.
-    
-    If the agent’s chosen move is illegal (which can happen early in training),
-    a random legal move is chosen instead.
-    """
-    env = StrategoEnv()
+
+# =============================================================================
+# Simulation
+# =============================================================================
+
+
+def run_simulation(model, episodes: int = 3):
+    """Run evaluation episodes with the trained model."""
+    env = StrategoEnv(render_mode="human")
+
     for ep in range(episodes):
-        obs = env.reset()
+        obs, _ = env.reset()
         done = False
+        total_reward = 0.0
         print(f"--- Episode {ep + 1} ---")
+
         while not done:
             env.render()
-            # Retrieve legal moves for the agent.
-            legal_moves = env.get_legal_moves(1)
-            if not legal_moves:
-                print("No legal moves available for the agent!")
+            masks = env.action_masks()
+            if not masks.any():
+                print("No legal moves for agent!")
                 break
-            # The model predicts an action based on the current observation.
-            action, _ = model.predict(obs)
-            # If the predicted action is not legal, pick one at random.
-            if tuple(action) not in legal_moves:
-                action = random.choice(legal_moves)
-            obs, reward, done, info = env.step(action)
+            action, _ = model.predict(obs, action_masks=masks, deterministic=True)
+            obs, reward, done, truncated, info = env.step(int(action))
+            total_reward += reward
+
         env.render()
-        if reward > 0:
+        if total_reward > 0:
             print("Agent wins!")
-        elif reward < 0:
+        elif total_reward < 0:
             print("Agent loses!")
         else:
             print("Draw!")
-        print("\n")
+        print(f"Total reward: {total_reward:.3f}\n")
+
 
 # =============================================================================
-# Main Entry Point
+# Main
 # =============================================================================
 
 if __name__ == "__main__":
-    # Train the RL agent. Adjust the total timesteps as needed.
-    model = train_agent(total_timesteps=50000)
-    
-    # Run simulation episodes to see the trained agent in action.
+    model = train_agent(total_timesteps=1_000_000)
     run_simulation(model, episodes=3)
